@@ -3,7 +3,6 @@
 # Copyright (C) 2007-2012, GoodData(R) Corporation. All rights reserved
 
 import logging
-lg = logging.getLogger('smokerd.pluginmanager')
 
 from smoker.server.exceptions import *
 import smoker.util.command
@@ -11,246 +10,13 @@ import smoker.util.command
 import os
 import datetime
 import time
-import threading
 import simplejson
 import re
 import types
+import multiprocessing
 
-# Initialize threading semamphore, by default limit by
-# number of online CPUs + 2
-semaphore_count = int(os.sysconf('SC_NPROCESSORS_ONLN')) + 2
-lg.info("Plugins will run approximately at %s threads in parallel" % semaphore_count)
-semaphore = threading.Semaphore(semaphore_count)
 
-class PluginManager(object):
-    """
-    PluginManager provides management and
-    access to plugins
-    """
-    # Configured plugins/templates/actions
-    conf_plugins   = None
-    conf_actions   = None
-    conf_templates = None
-
-    # Plugin objects
-    plugins = {}
-
-    # Processes
-    processes = []
-    # We don't want to have process ID 0 (first index)
-    # so fill it by None
-    processes.append(None)
-
-    def __init__(self, plugins=None, actions=None, templates=None):
-        """
-        PluginManager constructor
-         * load plugins/templates/actions configuration
-         * create plugins objects
-        """
-        self.conf_plugins   = plugins
-        self.conf_actions   = actions
-        self.conf_templates = templates
-
-        self.stopping = False
-
-        # Load Plugin objects
-        self.load_plugins()
-
-    def start(self):
-        """
-        Start all plugins
-        """
-        for name, plugin in self.plugins.iteritems():
-            plugin.start()
-
-    def stop(self, blocking=True):
-        """
-        Stop all plugins
-        Wait until they are stopped if blocking=True
-        """
-        self.stopping = True
-
-        # Trigger stop of all plugins
-        for name, plugin in self.plugins.iteritems():
-            plugin.stop()
-
-        # Wait until all plugins are stopped
-        if blocking:
-            plugins_left = self.plugins.keys()
-            plugins_left_cnt = len(plugins_left)
-            while plugins_left:
-                plugins_left = []
-                for name, plugin in self.plugins.iteritems():
-                    if plugin.isAlive():
-                        plugins_left.append(name)
-                if plugins_left:
-                    # Print info only if number of left plugins changed
-                    if len(plugins_left) != plugins_left_cnt:
-                        lg.info("Waiting for %s plugins to shutdown: %s" % (len(plugins_left), ','.join(plugins_left)))
-                    plugins_left_cnt = len(plugins_left)
-                    time.sleep(0.5)
-
-    def load_plugins(self):
-        """
-        Create Plugin objects
-        """
-        # Check if BasePlugin template is present
-        # or raise exception
-        try:
-            self.get_template('BasePlugin')
-        except (TemplateNotFound, NoTemplatesConfigured):
-            lg.error("Required BasePlugin template is not configured!")
-            raise BasePluginTemplateNotFound
-
-        for plugin, options in self.conf_plugins.iteritems():
-            if options.has_key('Enabled') and options['Enabled'] == False:
-                lg.info("Plugin %s is disabled, skipping.." % plugin)
-                continue
-
-            try:
-                self.plugins[plugin] = self.load_plugin(plugin, options)
-            except TemplateNotFound:
-                lg.error("Can't find configured template %s for plugin %s, plugin not loaded" % (options['Template'], plugin))
-                continue
-            except NoTemplatesConfigured:
-                lg.error("There are no templates configured, template %s is required by plugin %s, plugin not loaded" % (options['Template'], plugin))
-                continue
-            except AssertionError as e:
-                lg.error("Plugin %s not loaded: AssertionError, %s" % (plugin, e))
-                continue
-            except Exception as e:
-                lg.error("Plugin %s not loaded: %s" % (plugin, e))
-                lg.exception(e)
-                continue
-            lg.info("Loaded plugin %s" % plugin)
-
-        if len(self.plugins) == 0:
-            lg.error("No plugins loaded!")
-            raise NoRunningPlugins("No plugins loaded!")
-
-    def load_plugin(self, plugin, options):
-        """
-        Create and return Plugin object
-        """
-        # Load BasePlugin template first
-        try:
-            template = self.get_template('BasePlugin')
-        except:
-            template = {}
-
-        # Plugin has template, load it's parent params
-        if options.has_key('Template'):
-            template_custom = self.get_template(options['Template'])
-            template = dict(template, **template_custom)
-
-        if options.has_key('Action'):
-            options['Action'] = self.get_action(options['Action'])
-
-        params = dict(template, **options)
-        return Plugin(self, plugin, params)
-
-    def get_template(self, name):
-        """
-        Return template parameters
-        """
-        if not isinstance(self.conf_templates, dict):
-            raise NoTemplatesConfigured
-
-        try:
-            params = self.conf_templates[name]
-        except KeyError:
-            raise TemplateNotFound("Can't find configured template %s" % name)
-
-        return params
-
-    def get_action(self, name):
-        """
-        Return template parameters
-        """
-        if not isinstance(self.conf_actions, dict):
-            raise NoActionsConfigured
-
-        try:
-            params = self.conf_actions[name]
-        except KeyError:
-            raise ActionNotFound("Can't find configured action %s" % name)
-
-        return params
-
-    def get_plugins(self, filter=None):
-        """
-        Return all plugins or filter them by parameter
-        """
-
-        if filter:
-            plugins = []
-            key = filter.keys()[0]
-            value = filter[key]
-
-            for plugin in self.plugins.itervalues():
-                if plugin.params.has_key(key):
-                    if plugin.params[key] == value:
-                        plugins.append(plugin)
-            return plugins
-        else:
-            return self.plugins
-
-    def get_plugin(self, name):
-        """
-        Return single plugin
-        """
-        try:
-            return self.plugins[name]
-        except KeyError:
-            raise NoSuchPlugin("Plugin %s not found" % name)
-
-    def add_process(self, plugins=None, filter=None):
-        """
-        Add process and force plugin run
-        """
-        plugins_list = []
-
-        # Add plugins by name
-        if plugins:
-            for plugin in plugins:
-                plugins_list.append(self.get_plugin(plugin))
-
-        # Add plugins by filter
-        if filter:
-            plugins_list.extend(self.get_plugins(filter))
-
-        # Raise exception if no plugins was found
-        if len(plugins_list) == 0:
-            raise NoPluginsFound
-
-        process = {
-            'plugins' : plugins_list,
-        }
-
-        plugins_name = []
-        for p in plugins_list:
-            plugins_name.append(p.name)
-
-        lg.info("Forcing run of %d plugins: %s" % (len(plugins_list), ', '.join(plugins_name)))
-
-        # Add process into the list
-        self.processes.append(process)
-        id = len(self.processes)-1
-
-        # Force run for each plugin and clear forced_result
-        for plugin in plugins_list:
-            plugin.force = True
-            plugin.forced_result = None
-
-        return id
-
-    def get_process(self, id):
-        """
-        Return process
-        """
-        return self.processes[id]
-
-class Plugin(threading.Thread, object):
+class Plugin(multiprocessing.Process, object):
     """
     Object that represents single plugin
     """
@@ -280,7 +46,7 @@ class Plugin(threading.Thread, object):
 
     next_run = False
 
-    def __init__(self, pluginmgr, name, params):
+    def __init__(self, pluginmgr, name, params, semaphore):
         """
         Plugin constructor
          * load parameters and plugin name
@@ -290,7 +56,9 @@ class Plugin(threading.Thread, object):
         assert isinstance(params, dict)
         self.name = name
         self.params = dict(self.params_default, **params)
-        self.stopping = False
+        self.semaphore = semaphore
+
+        self.lg = logging.getLogger('smokerd.plugin.%s' % name)
 
         # Set Action properly to have all
         # required default parameters
@@ -317,15 +85,15 @@ class Plugin(threading.Thread, object):
 
         # Drop privileges
         if self.params['uid'] != 'default' or self.params['gid'] != 'default':
-            lg.debug("Plugin %s: dropping privileges to %s/%s" % (self.name, self.params['uid'], self.params['gid']))
+            self.lg.debug("Plugin %s: dropping privileges to %s/%s" % (self.name, self.params['uid'], self.params['gid']))
             try:
                 os.setegid(self.params['gid'])
                 os.seteuid(self.params['uid'])
             except TypeError as e:
-                lg.error("Plugin %s: config parameters uid/gid have to be integers: %s" % (self.name, e))
+                self.lg.error("Plugin %s: config parameters uid/gid have to be integers: %s" % (self.name, e))
                 raise
             except OSError as e:
-                lg.error("Plugin %s: can't switch effective UID/GID to %s/%s: %s" % (self.name, self.params['uid'], self.params['gid'], e))
+                self.lg.error("Plugin %s: can't switch effective UID/GID to %s/%s: %s" % (self.name, self.params['uid'], self.params['gid'], e))
                 raise
 
         # Schedule first plugin run
@@ -335,13 +103,6 @@ class Plugin(threading.Thread, object):
         # Run Thread constructor, we want to be daemonic thread
         super(Plugin, self).__init__()
         self.daemon = True
-
-    def stop(self):
-        """
-        Set stopping variable
-        """
-        self.stopping = True
-        return self.stopping
 
     def validate(self):
         """
@@ -369,23 +130,25 @@ class Plugin(threading.Thread, object):
         Run thread
         Check if plugin should be run and execute it
         """
-        while self.stopping is not True:
-            # Plugin run when forced
-            if self.force == True:
-                with semaphore:
-                    self.run_plugin()
-                self.force = False
-                self.forced_result = self.get_last_result()
-            else:
-                # Plugin run in interval
-                if self.params['Interval']:
-                    if datetime.datetime.now() >= self.next_run:
-                        with semaphore:
-                            self.run_plugin()
-            time.sleep(1)
-
-        # Stop the thread
-        lg.info("Shutting down plugin %s" % self.name)
+        try:
+            while True:
+                # Plugin run when forced
+                if self.force == True:
+                    with self.semaphore:
+                        self.run_plugin()
+                    self.force = False
+                    self.forced_result = self.get_last_result()
+                else:
+                    # Plugin run in interval
+                    if self.params['Interval']:
+                        if datetime.datetime.now() >= self.next_run:
+                            with self.semaphore:
+                                self.run_plugin()
+                time.sleep(1)
+        except (KeyboardInterrupt, SystemExit):
+            # Stop the thread
+            self.lg.info("Shutting down plugin %s" % self.name)
+            sys.exit(0)
 
     def schedule_run(self, time=None, now=False):
         """
@@ -409,7 +172,7 @@ class Plugin(threading.Thread, object):
         Run system command and parse output
         """
         result = Result()
-        lg.debug("Plugin %s: executing command %s" % (self.name, command))
+        self.lg.debug("Plugin %s: executing command %s" % (self.name, command))
 
         # Prepare params for stdin
         tmp = os.tmpfile()
@@ -420,7 +183,7 @@ class Plugin(threading.Thread, object):
         except smoker.util.command.ExecutionTimeout as e:
             raise PluginExecutionTimeout(e)
         except Exception as e:
-            lg.exception(e)
+            self.lg.exception(e)
             raise PluginExecutionError("Can't execute command %s: %s" % (command, e))
 
         if returncode:
@@ -457,7 +220,7 @@ class Plugin(threading.Thread, object):
                     raise PluginMalformedOutput("Missing status in JSON output: %s" % json)
             else:
                 # Output is not JSON, use stdout/stderr and return value
-                lg.debug("Plugin %s: using non-JSON output" % self.name)
+                self.lg.debug("Plugin %s: using non-JSON output" % self.name)
                 result.set_status(status)
                 if stderr:
                     result.add_error(re.sub('^\n', '', stderr.strip()))
@@ -471,31 +234,31 @@ class Plugin(threading.Thread, object):
         Run parser on given stdout/stderr
         Raise exceptions if anything happen
         """
-        lg.debug("Plugin %s: running parser %s" % (self.name, self.params['Parser']))
+        self.lg.debug("Plugin %s: running parser %s" % (self.name, self.params['Parser']))
 
         if stdout:
-            lg.debug("Plugin %s: stdout: %s" % (self.name, stdout.strip()))
+            self.lg.debug("Plugin %s: stdout: %s" % (self.name, stdout.strip()))
         if stderr:
-            lg.debug("Plugin %s: stderr: %s" % (self.name, stderr.strip()))
+            self.lg.debug("Plugin %s: stderr: %s" % (self.name, stderr.strip()))
 
         try:
             parser = __import__(self.params['Parser'], globals(), locals(), ['Parser'], -1)
         except ImportError as e:
-            lg.error("Plugin %s: can't load parser %s: %s" % (self.name, self.params['Parser'], e))
+            self.lg.error("Plugin %s: can't load parser %s: %s" % (self.name, self.params['Parser'], e))
             raise
 
         try:
             parser = parser.Parser(stdout, stderr)
         except Exception as e:
-            lg.error("Plugin %s: can't initialize parser: %s" % (self.name, e))
-            lg.exception(e)
+            self.lg.error("Plugin %s: can't initialize parser: %s" % (self.name, e))
+            self.lg.exception(e)
             raise
 
         try:
             result = parser.parse()
         except Exception as e:
-            lg.error("Plugin %s: parser execution failed: %s" % (self.name, e))
-            lg.exception(e)
+            self.lg.error("Plugin %s: parser execution failed: %s" % (self.name, e))
+            self.lg.exception(e)
             raise
 
         return result
@@ -505,25 +268,25 @@ class Plugin(threading.Thread, object):
         Run Python module
         Raise exceptions if anything happen
         """
-        lg.debug("Plugin %s: running module %s" % (self.name, module))
+        self.lg.debug("Plugin %s: running module %s" % (self.name, module))
         try:
             plugin = __import__(module, globals(), locals(), ['Plugin'], -1)
         except ImportError as e:
-            lg.error("Plugin %s: can't load module %s: %s" % (self.name, module, e))
+            self.lg.error("Plugin %s: can't load module %s: %s" % (self.name, module, e))
             raise
 
         try:
             plugin = plugin.Plugin(self, **kwargs)
         except Exception as e:
-            lg.error("Plugin %s: can't initialize plugin module: %s" % (self.name, e))
-            lg.exception(e)
+            self.lg.error("Plugin %s: can't initialize plugin module: %s" % (self.name, e))
+            self.lg.exception(e)
             raise
 
         try:
             result = plugin.run()
         except Exception as e:
-            lg.error("Plugin %s: module execution failed: %s" % (self.name, e))
-            lg.exception(e)
+            self.lg.error("Plugin %s: module execution failed: %s" % (self.name, e))
+            self.lg.exception(e)
             raise
 
         return result
@@ -542,7 +305,7 @@ class Plugin(threading.Thread, object):
             try:
                 result = self.run_command(command, self.params['Timeout'])
             except Exception as e:
-                lg.error("Plugin %s: %s" % (self.name, e))
+                self.lg.error("Plugin %s: %s" % (self.name, e))
                 result = Result()
                 result.set_status('ERROR')
                 result.add_error(e)
@@ -551,20 +314,20 @@ class Plugin(threading.Thread, object):
             try:
                 result = self.run_module(self.params['Module'])
             except Exception as e:
-                lg.error("Plugin %s: %s" % (self.name, e))
+                self.lg.error("Plugin %s: %s" % (self.name, e))
                 result = Result()
                 result.set_status('ERROR')
                 result.add_error(re.sub('^\n', '', ('%s' % e).strip()))
         # No module or command to run
         else:
-            lg.error("Plugin %s: no Command or Module to execute!" % self.name)
+            self.lg.error("Plugin %s: no Command or Module to execute!" % self.name)
             result = Result()
             result.set_status('ERROR')
             result.add_error('No Command or Module to execute!')
 
         # Run action on result
         if self.params['Action']:
-            lg.debug("Plugin %s: executing action" % self.name)
+            self.lg.debug("Plugin %s: executing action" % self.name)
             # Execute external command
             if self.params['Action']['Command']:
                 # Add parameters to command with format
@@ -574,7 +337,7 @@ class Plugin(threading.Thread, object):
                 try:
                     action = self.run_command(self.params['Action']['Command'] % params, timeout=self.params['Action']['Timeout'])
                 except Exception as e:
-                    lg.error("Plugin %s: %s" % (self.name, e))
+                    self.lg.error("Plugin %s: %s" % (self.name, e))
                     action = Result()
                     action.set_status('ERROR')
                     action.add_error(e)
@@ -583,13 +346,13 @@ class Plugin(threading.Thread, object):
                 try:
                     action = self.run_module(self.params['Action']['Module'], result=result)
                 except Exception as e:
-                    lg.error("Plugin %s: %s" % (self.name, e))
+                    self.lg.error("Plugin %s: %s" % (self.name, e))
                     action = Result()
                     action.set_status('ERROR')
                     action.add_error(e)
             # No command or module to execute
             else:
-                lg.error("Plugin %s: no Action Command or Module to execute!" % self.name)
+                self.lg.error("Plugin %s: no Action Command or Module to execute!" % self.name)
                 action = Result()
                 action.set_status('ERROR')
                 action.add_error('No Command or Module to execute!')
@@ -600,14 +363,14 @@ class Plugin(threading.Thread, object):
         try:
             self.result.append(result.get_result())
         except ValidationError as e:
-            lg.error("Plugin %s: ValidationError: %s" % (self.name, e))
+            self.lg.error("Plugin %s: ValidationError: %s" % (self.name, e))
             result = Result()
             result.set_status('ERROR')
             result.add_error('ValidationError: %s' % e)
             self.result.append(result.get_result())
 
         # Log result
-        lg.info("Plugin %s result: %s" % (self.name, result.get_result()))
+        self.lg.info("Plugin %s result: %s" % (self.name, result.get_result()))
 
         # Remove earliest result to keep only number
         # of results by parameter

@@ -5,7 +5,7 @@
 import logging
 lg = logging.getLogger('smokerd.daemon')
 
-from smoker.server.plugins import PluginManager
+from smoker.server.pluginmanager import PluginManager
 from smoker.server.httpserver import ThreadedHTTPServer, HTTPHandler
 
 import yaml
